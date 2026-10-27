@@ -13,46 +13,46 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/drivers/console.rs` (863) Framebuffer text console with a cell grid, 16 colors and a visible cursor. Types: `Console`.
 - `kernel/src/drivers/console_device.rs` (241) The console as a device of the Linux server (ADR 0004, ADR 0007, ADR 0020): the console's answers to queries (and COM1's input while no terminal holds that port) go into a ring, the bytes written go to the screen and... Types: `Writer`.
 - `kernel/src/drivers/glyphs.rs` (202) Characters the console draws geometrically instead of from the font: box drawing (U+2500-257F), block elements (U+2580-259F), geometric shapes, arrows and the VT100 scan lines.
-- `kernel/src/drivers/keyboard.rs` (145) PS/2 keyboard (ADR 0020): the interrupt queues the controller's bytes (scancode set 1, as the controller translates) for the console's holder, untranslated.
+- `kernel/src/drivers/keyboard.rs` (149) PS/2 keyboard (ADR 0020): the interrupt queues the controller's bytes (scancode set 1, as the controller translates) for the console's holder, untranslated.
 - `kernel/src/drivers/mod.rs` (9) Device drivers the kernel keeps: ACPI tables, the framebuffer console and the console device the Linux server's terminals drive, the keyboard, PCI enumeration, the CMOS clock, the reference clocks the TSC is measured...
-- `kernel/src/drivers/pci.rs` (89) PCI enumeration through configuration mechanism #1 (ports 0xcf8/0xcfc). Types: `Device`.
+- `kernel/src/drivers/pci.rs` (230) PCI enumeration through configuration mechanism #1 (ports 0xcf8/0xcfc). Types: `Device`, `MemoryBar`, `Msi`.
 - `kernel/src/drivers/refclock.rs` (128) Reference clocks of known frequency that the TSC is measured against when neither the CPU nor a hypervisor states its frequency (`time::init`, ADR 0016): the HPET, then the ACPI PM timer, both found in the ACPI...
 - `kernel/src/drivers/rtc.rs` (43) CMOS real-time clock: read once at boot; wall-clock time afterwards is kept by `time` (the boot time plus the monotonic clock).
 - `kernel/src/drivers/serial.rs` (236) The serial ports COM1-COM4 (16550 UARTs, ADR 0020): found at start-up by their scratch register (most laptops have none), run at 115200 baud, 8N1. Types: `Uart`.
 - `kernel/src/fs/cache.rs` (2008) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `CacheCounts`, `Pager`, `Sharer`, `FileTimes`, `Backing`, `Dirtied`, `Fill`, `Lookup`, `PageWait`, `Scan`, `Filled`, `PageCache`, `Opened`.
 - `kernel/src/fs/cpio.rs` (75) Finds a file in a cpio archive in "newc" format (the boot image's initramfs), following the archive's symlinks.
 - `kernel/src/fs/mod.rs` (16) The boot image and the kernel's memory objects.
-- `kernel/src/interrupts/apic.rs` (256) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
-- `kernel/src/interrupts/entry.rs` (140) Uniform entry for every interrupt and exception (except NMI and double fault, and #DB's own paranoid entry on its IST stack, `debug_entry`): a per-vector stub pushes the vector (and a dummy error code where the CPU...
+- `kernel/src/interrupts/apic.rs` (261) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
+- `kernel/src/interrupts/entry.rs` (143) Uniform entry for every interrupt and exception (except NMI and double fault, and #DB's own paranoid entry on its IST stack, `debug_entry`): a per-vector stub pushes the vector (and a dummy error code where the CPU...
 - `kernel/src/interrupts/gdt.rs` (99) Per-CPU GDT and TSS. Types: `CpuTables`.
-- `kernel/src/interrupts/handlers.rs` (223) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults; a Linux program's other faults go to its server, a native server dies of its...
+- `kernel/src/interrupts/handlers.rs` (224) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults; a Linux program's other faults go to its server, a native server dies of its...
 - `kernel/src/interrupts/mod.rs` (76) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/klog.rs` (298) The kernel's log: a ring of records (Linux's printk buffer) that `printk`, the Linux servers' messages and the native servers' output go to, read by the Linux server for `syslog(2)` and `/dev/kmsg` (`dmesg`). Types: `Escaped`, `RateLimit`.
-- `kernel/src/main.rs` (173) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes, the other CPUs and the...
+- `kernel/src/main.rs` (230) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes, the other CPUs and the...
 - `kernel/src/memory/frame.rs` (203) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames and the memory group each frame is... Types: `PhysFrameAllocator`, `UserFrames`.
 - `kernel/src/memory/kstack.rs` (133) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/memcg.rs` (369) Memory groups: one per process tree (ADR 0024), Linux's cgroup v2 memory controller with one group per container (the tree's instance holds it; its processes and threads name it, `ThreadGroup::memcg`). Types: `Event`, `Limits`, `MemCg`, `Target`, `Charging`, `Path`.
 - `kernel/src/memory/mod.rs` (684) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, the commit and page-cache accounting with the overcommit policy, the process trees' memory... Types: `Caching`, `Scope`, `Reclaimed`, `Stats`.
 - `kernel/src/memory/oom.rs` (374) The out-of-memory killer (Linux's mm/oom_kill.c): when memory cannot be had after reclaim stopped making progress, it ends the process whose end gives back the most (its badness) with SIGKILL and has its private...
-- `kernel/src/process/address_space.rs` (1536) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
-- `kernel/src/process/channel.rs` (795) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
+- `kernel/src/process/address_space.rs` (1577) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/channel.rs` (960) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clock.rs` (16) The clocks a thread reads (`restricted::SYS_CLOCK_READ`): the wall clock, the monotonic clock, and the CPU time of its own process and of itself, by the kernel's clock ids (`restricted::CLOCK_*`).
 - `kernel/src/process/cputimer.rs` (54) CPU-time alarms: the mechanism under the Linux server's timers on CPU clocks (`ITIMER_VIRTUAL`, `ITIMER_PROF`, POSIX timers on `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID` and the CPU clocks of other... Types: `Alarms`.
 - `kernel/src/process/debugreg.rs` (70) A Linux program thread's hardware breakpoints (`restricted::SYS_THREAD_DEBUG`, ADR 0019): DR0-DR3 and the enables of DR7, armed only while the thread runs its program. Types: `DebugRegs`.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/errno.rs` (33) The kernel's error numbers, as its calls return them (negated): Linux's values, which the Linux server passes on to its programs unchanged.
-- `kernel/src/process/exec.rs` (50) A native server running its program anew (`oxrt::sys::EXEC`): the calling process gets a fresh address space with the server's program (the image the kernel read at boot; the kernel has no paths) and the given...
-- `kernel/src/process/exit.rs` (168) Ending threads and processes, and the kernel's wait for its own. Types: `WaitStatus`.
+- `kernel/src/process/exec.rs` (51) A native server running its program anew (`oxrt::sys::EXEC`): the calling process gets a fresh address space with the server's program (the image the kernel read at boot; the kernel has no paths) and the given...
+- `kernel/src/process/exit.rs` (169) Ending threads and processes, and the kernel's wait for its own. Types: `WaitStatus`.
 - `kernel/src/process/futex.rs` (717) Futexes: sleeping on a word of user memory, the mechanism under every pthread mutex, condition variable and join. Types: `Ends`, `WaitWord`.
 - `kernel/src/process/futex/pi.rs` (620) Priority-inheritance locks on futex words: the mechanism under Linux's PI futexes (FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI, FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI), whose decoding, timeouts and restarts... Types: `Target`, `Owner`.
 - `kernel/src/process/ipc.rs` (282) Synchronous message passing between the kernel and user-space servers: the control plane of the I/O rings. Types: `Instance`.
-- `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
+- `kernel/src/process/irq.rs` (74) Device interrupts for user-space drivers.
 - `kernel/src/process/kill.rs` (110) Killing threads and processes, and what the kernel's waits ask about it (`interrupted`, `dying`). Types: `GroupExit`, `ExitCell`.
 - `kernel/src/process/linux.rs` (2961) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `HeapArea`, `Instance`, `Object`, `Container`, `Record`, `LinuxThread`.
 - `kernel/src/process/loader.rs` (182) Loading a static ELF program into a new address space: its segments are mapped from the file's page cache (demand-paged, private), so every process running a program shares its unchanged pages. Types: `Image`.
 - `kernel/src/process/membarrier.rs` (77) membarrier(2)'s mechanisms (`restricted::SYS_MEMBARRIER`, ADR 0021): barriers on other CPUs, as Linux's kernel/sched/membarrier.c makes them.
-- `kernel/src/process/mod.rs` (579) Processes and threads: the process table, the current task, the servers the kernel starts and the process trees it starts with their Linux server instance; the submodules hold scheduling, address spaces, exit and... Types: `Server`, `Tree`.
-- `kernel/src/process/native.rs` (143) The system calls of the kernel's native servers (diskfs, netd, procfs, ringtest; `oxrt::sys`): the kernel's own interface, numbered as the Linux server's (`restricted`) where a call is the same mechanism (memory,...
+- `kernel/src/process/mod.rs` (665) Processes and threads: the process table, the current task, the servers the kernel starts and the process trees it starts with their Linux server instance; the submodules hold scheduling, address spaces, exit and... Types: `Server`, `Tree`.
+- `kernel/src/process/native.rs` (154) The system calls of the kernel's native servers (diskfs, netd, procfs, ringtest; `oxrt::sys`): the kernel's own interface, numbered as the Linux server's (`restricted`) where a call is the same mechanism (memory,...
 - `kernel/src/process/query.rs` (67) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`): the system-wide record only, for it and for the Linux server...
 - `kernel/src/process/sched.rs` (811) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Share`, `OpenShare`, `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Wait`.
 - `kernel/src/process/syscall.rs` (230) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch by who calls: a Linux program's call goes to its server (restricted mode), the Linux server's calls are the... Types: `Frame`.
@@ -144,6 +144,19 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/procfs/src/render.rs` (40) The formats of procfs's own making: /proc/cpuinfo (from CPUID, an unprivileged instruction) and /proc/version.
 - `servers/procfs/src/tree.rs` (139) The two trees procfs serves: the system-wide part of /proc (its root is `PROC_ROOT`) and /sys (`SYSFS_ROOT`).
 - `servers/ringtest/src/main.rs` (285) ringtest: the far end of the self-tests' channels (test mode only).
+- `servers/usbd/src/device.rs` (323) A USB device on the controller: its slot (enabled, addressed: xHCI 1.2, 4.3), its control endpoint's transfers (waited for), its other endpoints (configured together, 4.6.6) and their transfers (queued, completed by... Types: `Position`, `Completed`, `Device`.
+- `servers/usbd/src/dma.rs` (83) The DMA area the kernel granted usbd (`oxrt::dma_map`: physically contiguous, `USBD_DMA_PAGES` pages, the same across restarts), handed out in page runs: the controller's tables and rings, the devices' contexts and... Types: `Buf`, `Dma`.
+- `servers/usbd/src/hub.rs` (94) Hubs (USB 2 and USB 3, `usb::hub`): a hub's slot is made one (its ports in the slot context), its ports powered, its status change endpoint watched; a port that changed is looked at, a device that came is reset and... Types: `Hub`.
+- `servers/usbd/src/kbd.rs` (75) USB keyboards in the HID boot protocol (`usb::hid`): their reports become the PS/2 keyboard's scancodes on the console (the kernel's `kbd_input`), with the autorepeat a PS/2 keyboard makes itself and the LEDs the... Types: `Keyboard`.
+- `servers/usbd/src/main.rs` (388) usbd: the USB server.
+- `servers/usbd/src/net/link.rs` (47) A network function's link to netd (the link protocol, `linkring`): the channel usbd makes and offers netd, its frame rings and doorbells. Types: `Futex`, `Link`.
+- `servers/usbd/src/net/mod.rs` (339) The Ethernet functions usbd drives (USB tethering, `usb::function`): binding one (CDC-ECM, CDC-NCM, RNDIS: each kind's setup, `bind`), its link to netd (`link`), and the data path: bulk IN transfers queued all the... Types: `Net`.
+- `servers/usbd/src/net/rndis.rs` (114) RNDIS's control side (`usb::rndis`): commands as encapsulated commands, their completions fetched as encapsulated responses (polled at once, as Linux's rndis_host does: the notification is optional), the device's own... Types: `Rndis`.
+- `servers/usbd/src/xhci/context.rs` (129) Device and input contexts (xHCI 1.2, 6.2): the slot context and the endpoint contexts the controller keeps per device, and the input context software hands it in commands. Types: `Input`, `Output`.
+- `servers/usbd/src/xhci/mod.rs` (309) The xHCI host controller (eXtensible Host Controller Interface 1.2): taking it over from the firmware, resetting and starting it, its command ring, its event ring and interrupter 0, its root hub's ports and doorbells. Types: `Error`, `Xhci`.
+- `servers/usbd/src/xhci/regs.rs` (89) The xHCI controller's registers (xHCI 1.2, chapter 5): the capability, operational, runtime and doorbell registers and the extended capabilities, in the BAR the kernel mapped uncached (`oxrt::mmio_map`). Types: `Mmio`.
+- `servers/usbd/src/xhci/ring.rs` (120) The controller's rings (xHCI 1.2, 4.9): a producer ring (the command ring, each endpoint's transfer ring), one page of TRBs closed by a Link TRB back to its start, and the event ring the controller produces into (one... Types: `Ring`, `EventRing`.
+- `servers/usbd/src/xhci/trb.rs` (138) Transfer request blocks (xHCI 1.2, 6.4): the 16-byte entries of every ring, built for the command and transfer rings and decoded from the event ring. Types: `Trb`, `Event`.
 
 ## Libraries
 
@@ -168,10 +181,12 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/ldisc/src/lib.rs` (572) Linux's N_TTY line discipline as a library, for the Linux server's terminals (docs/design/linux-server.md, "The terminal"): input mapping, signals from the keyboard, flow control, canonical line editing with echo,... Types: `Received`, `Take`, `ReadMode`, `Ldisc`.
 - `crates/ldisc/src/termios.rs` (224) Terminal settings as Linux keeps them: `struct termios` and `struct termios2` in x86-64's layout (tcgetattr's TCGETS, TCGETS2), their flags and control characters, and the defaults of Linux's `tty_std_termios`. Types: `Termios`.
 - `crates/ldisc/tests/ldisc.rs` (338) The line discipline against Linux's N_TTY behavior: canonical editing and its echo, end of file, literal next, signals and flushing, input mapping, noncanonical reads, mode switches, flow control, output processing...
+- `crates/linkring/src/lib.rs` (298) The link protocol (ADR 0025): what a link driver (a network function usbd found on USB, as the client) and netd (the service) share over a channel (`ring::channel`) for one Ethernet link. Types: `Info`, `Violation`, `Area`, `Producer`, `Consumer`.
+- `crates/linkring/tests/protocol.rs` (236) The link protocol on the host: the description survives and malformed ones are refused, frames come out as they went in (wrapping with pad records), a full ring refuses, a hostile peer's positions and records are...
 - `crates/netlink/src/lib.rs` (695) NETLINK_ROUTE's messages (netlink(7), rtnetlink(7)): the requests a program sends to the kernel's end of a netlink socket and the answers, for the Linux server's netlink sockets; kept apart from the server so they... Types: `Ipv4`, `Interface`, `Route`, `Notification`, `Dump`, `Reply`.
 - `crates/netring/src/lib.rs` (880) The socket protocol of the data plane (phase R7b, ADR 0008): what the Linux server (the client) and netd (the service) share over a channel (`ring::channel`) for the instance's internet sockets. Types: `Kind`, `Line`, `Bitmap`, `ArenaHeader`, `NetdLine`, `Urgent`, `UrgentMark`, `ClientLine`, `Ctl`, `SharedArea`, `Area`, `Buf`, `Endpoint`, `Request`, `Budget`, `PortHolder`, `PortClaim`, `IcmpKey`, `EchoIds`, `Record`, `Link`.
 - `crates/netring/tests/protocol.rs` (645) The socket protocol's encodings and its shared memory: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, areas, endpoints and sockets...
-- `crates/oxrt/src/lib.rs` (310) Minimal runtime for oxidenix's native servers: entry point, raw system calls (the kernel's own interface: no Linux call, the kernel implements none), a heap, printing and port I/O. Types: `Event`, `Stdout`.
+- `crates/oxrt/src/lib.rs` (345) Minimal runtime for oxidenix's native servers: entry point, raw system calls (the kernel's own interface: no Linux call, the kernel implements none), a heap, printing and port I/O. Types: `Event`, `Stdout`.
 - `crates/pageheap/src/charge.rs` (226) The kernel's account of one heap area's commitment (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`): its mapped pages and its reserve (commitment held beyond them, so that a server can allocate when the commit limit is... Types: `Pool`, `Error`, `Plan`, `Charge`.
 - `crates/pageheap/src/lib.rs` (280) A heap that gives memory back: the Linux server's (docs/design/linux-server.md, "The server's heap"). Types: `Backing`, `RawLock`, `Stats`, `Heap`.
 - `crates/pageheap/src/pages.rs` (474) The page allocator under the heap: runs of pages of the arena, each page allocated or free and committed or not, in bitmaps outside the arena, and a radix tree of summaries over them that finds the lowest run of free... Types: `Sum`, `ChunkMeta`, `Run`, `Plan`, `Pages`.
@@ -189,6 +204,15 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/ring/tests/spsc.rs` (213) The ring's invariants (docs/design/io-rings.md): FIFO order, a full ring refuses, positions wrap modulo 2^32, a consumer on another thread sees every entry's contents, and the doorbell protocol loses no wakeup.
 - `crates/slab/src/lib.rs` (139) Size classes for small allocations: objects of up to 2 KiB come from slabs (4 KiB, aligned to 4 KiB) cut into equal slots, and a class's free slots form an intrusive list, so allocating and freeing one is O(1). Types: `FreeList`.
 - `crates/slab/tests/classes.rs` (163) Size classes and free lists of the slab allocator.
+- `crates/usb/src/cdc.rs` (70) The Communications Device Class (CDC 1.2) as Ethernet functions use it: the class codes, the functional descriptors (union, Ethernet networking), the ECM requests and the notifications every CDC Ethernet function... Types: `Union`, `Ethernet`, `Notification`.
+- `crates/usb/src/descriptor.rs` (211) Standard descriptors (USB 2.0, 9.6; USB 3.2, 9.6): the device's, a configuration's with everything that follows it (interfaces, their alternate settings and endpoints, the class-specific descriptors in between,... Types: `Device`, `Endpoint`, `Functional`, `Interface`, `Association`, `Configuration`.
+- `crates/usb/src/function.rs` (85) Which Ethernet function a device offers, and how it is wired: its control interface (and notification endpoint), its data interface's alternate setting with the bulk endpoints, where its MAC address is. Types: `Kind`, `NetFunction`.
+- `crates/usb/src/hid.rs` (177) Keyboards of the HID class in the boot protocol (HID 1.11, appendix B): the 8-byte reports (modifier bits, a reserved byte, up to six keys pressed) turned into the PS/2 keyboard's scancodes (set 1, as the i8042... Types: `Keyboard`, `Repeat`.
+- `crates/usb/src/hub.rs` (113) Hubs (USB 2.0, 11.23-11.24; USB 3.2, 10.14-10.16): the hub descriptor, a port's status, the class requests on ports, and the status change bitmap of the hub's interrupt endpoint. Types: `Descriptor`, `PortStatus`.
+- `crates/usb/src/lib.rs` (114) The USB protocols usbd speaks with devices, apart from the host controller (the xHCI driver is usbd's): standard requests (`SetupPacket`), descriptors (`descriptor`), which network function a device offers and how it... Types: `SetupPacket`, `Speed`.
+- `crates/usb/src/ncm.rs` (153) CDC-NCM 1.0's transfer blocks: frames travel in NTBs, each a header (NTH16), one or more datagram pointer tables (NDP16) and the frames they point to; the 16-bit format, which every function supports, is the one usbd... Types: `Parameters`, `Builder`.
+- `crates/usb/src/rndis.rs` (149) Microsoft's Remote NDIS (RNDIS 1.0 over USB) as a host speaks it: control messages travel as CDC encapsulated commands and responses on the control endpoint, frames as `PACKET_MSG`s on the bulk endpoints (several per... Types: `Initialized`, `Response`, `Packets`.
+- `crates/usb/tests/protocols.rs` (426) The USB protocols on the host: descriptors as real devices send them (QEMU's usb-net, an Android phone's RNDIS and NCM tethering functions) and malformed ones, the choice of configuration and function, RNDIS's...
 - `crates/vfs/src/cpio.rs` (80) The initramfs: a cpio archive in "newc" format. Types: `Header`, `Entry`, `Entries`.
 - `crates/vfs/src/lib.rs` (16) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
 - `crates/vfs/src/path.rs` (57) Path arithmetic.
@@ -201,7 +225,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (673) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (700) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 
@@ -263,6 +287,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/treetest.c` (993) Two process trees at once (ADR 0002): the self-tests' tree starts a second one (TEST_TREE_START: its own Linux server instance, no console) running this program as "treetest peer", and the two talk over a TCP...
 - `userspace/ttytest.c` (1333) Terminals, the Linux server's (phase R6d), driven through pseudo-terminals: termios round trips, canonical and raw reads with VMIN and VTIME, echo and line editing, output processing, flow control, poll, window...
 - `userspace/unixtest.c` (887) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
+- `userspace/usbnettest.c` (174) USB tethering's tests (the USB boot, /etc/usbtests.sh): the machine has no network card, only USB Ethernet functions (QEMU's usb-net, see builder/src/main.rs, USB_NETWORK): usb0 (CDC-ECM, on a root port, on...
 - `userspace/vdsotest.c` (383) The vDSO (ADR 0014): AT_SYSINFO_EHDR names an ELF shared object (linux-vdso.so.1) whose five functions are found by name and the version LINUX_2.6, as musl and glibc look them up; every clock it answers agrees with...
 - `userspace/vmtest.c` (258) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
 - `userspace/waittest.c` (226) Processes in the Linux server (R8): wait4 and waitid with their options (WNOHANG, WNOWAIT, WEXITED, WSTOPPED, WCONTINUED, __WCLONE, __WALL), the siginfo and rusage they report, SIGCHLD ignored or SA_NOCLDWAIT...
@@ -283,6 +308,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/rootfs/etc/rotests.sh` The self-tests on a read-only data disk: OXIDENIX_TEST=1 boots a second time with the disk the first boot wrote (QEMU's readonly=on, which virtio-blk reports as VIRTIO_BLK_F_RO), OXIDENIX_TEST=readonly boots so alone...
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
+- `userspace/rootfs/etc/usbtests.sh` The self-tests of USB tethering: OXIDENIX_TEST=1 boots a third time on a machine without a network card, with USB Ethernet functions on its xHCI controller instead (QEMU's usb-net: CDC-ECM on a root port, RNDIS...
 
 ## Kernel ABI of the Linux server
 
@@ -292,11 +318,11 @@ kernel that handle them.
 | nr | call | handled at |
 |---|---|---|
 | 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:251, kernel/src/process/syscall.rs:267 |
-| 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1757 |
+| 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1757, kernel/src/process/native.rs:82 |
 | 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:1774 |
-| 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1782, kernel/src/process/native.rs:71 |
-| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:2840, kernel/src/process/native.rs:72 |
-| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:2841, kernel/src/process/native.rs:73 |
+| 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1782, kernel/src/process/native.rs:86 |
+| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:2840, kernel/src/process/native.rs:87 |
+| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:2841, kernel/src/process/native.rs:88 |
 | 1017 | `SYS_MO_READ` | kernel/src/process/linux.rs:2842, kernel/src/process/linux.rs:2861 |
 | 1018 | `SYS_MO_WRITE` | kernel/src/process/linux.rs:2842, kernel/src/process/linux.rs:2854 |
 | 1019 | `SYS_MO_CREATE_PAGED` | kernel/src/process/linux.rs:1841 |
@@ -308,9 +334,9 @@ kernel that handle them.
 | 1026 | `SYS_VM_REMAP` | kernel/src/process/linux.rs:1838 |
 | 1027 | `SYS_VM_DISCARD` | kernel/src/process/linux.rs:1839 |
 | 1028 | `SYS_VM_SYNC` | kernel/src/process/linux.rs:1840 |
-| 1030 | `SYS_CLOCK_READ` | kernel/src/process/linux.rs:2149, kernel/src/process/native.rs:75 |
+| 1030 | `SYS_CLOCK_READ` | kernel/src/process/linux.rs:2149, kernel/src/process/native.rs:90 |
 | 1031 | `SYS_SLEEP_UNTIL` | kernel/src/process/linux.rs:2261 |
-| 1032 | `SYS_YIELD` | kernel/src/process/linux.rs:2273, kernel/src/process/native.rs:76 |
+| 1032 | `SYS_YIELD` | kernel/src/process/linux.rs:2273, kernel/src/process/native.rs:91 |
 | 1033 | `SYS_SET_USERCOPY` | kernel/src/process/linux.rs:2136 |
 | 1055 | `SYS_MO_CREATE_FILE` | kernel/src/process/linux.rs:2000 |
 | 1056 | `SYS_MO_HOLD` | kernel/src/process/linux.rs:2004 |
@@ -321,8 +347,8 @@ kernel that handle them.
 | 1061 | `SYS_INITRAMFS` | kernel/src/process/linux.rs:1989 |
 | 1062 | `SYS_MO_FROM_IMAGE` | kernel/src/process/linux.rs:1994 |
 | 1063 | `SYS_EVENT_RELEASES` | kernel/src/process/linux.rs:1861 |
-| 1064 | `SYS_CHAN_CREATE` | kernel/src/process/linux.rs:2310 |
-| 1065 | `SYS_CHAN_CONNECT` | kernel/src/process/linux.rs:2330 |
+| 1064 | `SYS_CHAN_CREATE` | kernel/src/process/linux.rs:2310, kernel/src/process/native.rs:80 |
+| 1065 | `SYS_CHAN_CONNECT` | kernel/src/process/linux.rs:2330, kernel/src/process/native.rs:81 |
 | 1066 | `SYS_GRANT` | kernel/src/process/linux.rs:2341 |
 | 1067 | `SYS_REVOKE` | kernel/src/process/linux.rs:2836 |
 | 1077 | `SYS_MO_FILLED` | kernel/src/process/linux.rs:2443 |
@@ -346,7 +372,7 @@ kernel that handle them.
 | 1142 | `SYS_THREAD_CREATE` | kernel/src/process/linux.rs:3227 |
 | 1143 | `SYS_THREAD_KICK` | kernel/src/process/linux.rs:3228 |
 | 1144 | `SYS_THREAD_KILL` | kernel/src/process/linux.rs:3232 |
-| 1145 | `SYS_THREAD_EXIT` | kernel/src/process/native.rs:81 |
+| 1145 | `SYS_THREAD_EXIT` | kernel/src/process/native.rs:96 |
 | 1146 | `SYS_EXEC_SPACE` | kernel/src/process/linux.rs:3239 |
 | 1147 | `SYS_PROC_INFO` | kernel/src/process/linux.rs:3240 |
 | 1148 | `SYS_THREAD_INFO` | kernel/src/process/linux.rs:3269 |
@@ -355,10 +381,10 @@ kernel that handle them.
 | 1151 | `SYS_THREAD_NAME` | kernel/src/process/linux.rs:3329 |
 | 1152 | `SYS_INIT_ARGS` | kernel/src/process/linux.rs:3338 |
 | 1153 | `SYS_VM_FLOOR` | kernel/src/process/linux.rs:3346 |
-| 1154 | `SYS_RANDOM` | kernel/src/process/linux.rs:2135, kernel/src/process/linux.rs:3353, kernel/src/process/native.rs:80 |
-| 1160 | `SYS_FUTEX_WAIT` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:74, kernel/src/process/native.rs:111 |
-| 1161 | `SYS_FUTEX_WAKE` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:74, kernel/src/process/native.rs:118 |
-| 1162 | `SYS_FUTEX_REQUEUE` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:74, kernel/src/process/native.rs:125 |
+| 1154 | `SYS_RANDOM` | kernel/src/process/linux.rs:2135, kernel/src/process/linux.rs:3353, kernel/src/process/native.rs:95 |
+| 1160 | `SYS_FUTEX_WAIT` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:89, kernel/src/process/native.rs:126 |
+| 1161 | `SYS_FUTEX_WAKE` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:89, kernel/src/process/native.rs:133 |
+| 1162 | `SYS_FUTEX_REQUEUE` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:89, kernel/src/process/native.rs:140 |
 | 1163 | `SYS_THREAD_FS` | kernel/src/process/linux.rs:2163 |
 | 1164 | `SYS_CLOCK_SET` | kernel/src/process/linux.rs:2176 |
 | 1165 | `SYS_POWER` | kernel/src/process/linux.rs:2183 |
@@ -374,8 +400,8 @@ kernel that handle them.
 | 1175 | `SYS_KLOG_CONSOLE` | kernel/src/process/linux.rs:2820 |
 | 1176 | `SYS_OOM_SCORE_ADJ` | kernel/src/process/linux.rs:2203 |
 | 1177 | `SYS_OVERCOMMIT` | kernel/src/process/linux.rs:2215 |
-| 1180 | `SYS_FUTEX_WAKE_OP` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:133 |
-| 1181 | `SYS_FUTEX_OWNER_DIED` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:140 |
+| 1180 | `SYS_FUTEX_WAKE_OP` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:148 |
+| 1181 | `SYS_FUTEX_OWNER_DIED` | kernel/src/process/linux.rs:2151, kernel/src/process/native.rs:155 |
 | 1182 | `SYS_FUTEX_LOCK_PI` | kernel/src/process/linux.rs:2157, kernel/src/process/linux.rs:2927 |
 | 1183 | `SYS_FUTEX_UNLOCK_PI` | kernel/src/process/linux.rs:2934 |
 | 1184 | `SYS_FUTEX_WAIT_REQUEUE_PI` | kernel/src/process/linux.rs:2940 |
@@ -468,6 +494,7 @@ kernel that handle them.
 - `docs/decisions/0022-core-dumps-in-the-linux-server.md` ADR 0022: Core dumps in the Linux server: threads park with their registers, memory from the kernel
 - `docs/decisions/0023-signal-driven-io-in-the-linux-server.md` ADR 0023: Signal-driven I/O in the Linux server, on the descriptions' watches
 - `docs/decisions/0024-per-tree-memory-limits.md` ADR 0024: Per-tree memory limits: every tree a memory group, charged by frame
+- `docs/decisions/0025-usb-and-tethering-in-servers.md` ADR 0025: USB in a server per controller, its network functions as links of netd
 - `docs/design/ext3-journal.md` The ext3 journal of the data disk
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU

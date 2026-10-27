@@ -43,7 +43,10 @@ An AI research project; see README.md.
   After they passed, the builder boots a second time (`<kernel>.test.readonly.img`) with that disk
   read-only (QEMU's `readonly=on`: virtio-blk's `VIRTIO_BLK_F_RO`) into `/etc/rotests.sh`
   (`rotest`: `EROFS`, `ST_RDONLY`, the data still readable); `OXIDENIX_TEST=readonly` runs
-  only that boot, on a fresh disk. In test mode a boot whose shutdown complains (an instance
+  only that boot, on a fresh disk. Then a third time (`<kernel>.test.usb.img`) without the
+  network card, with USB Ethernet functions on the xHCI controller instead (QEMU's usb-net:
+  CDC-ECM on a root port, RNDIS behind a hub), into `/etc/usbtests.sh` (`usbnettest`);
+  `OXIDENIX_TEST=usb` runs only that boot. In test mode a boot whose shutdown complains (an instance
   that did not write back or end, a channel that did not close) fails, whatever the script said.
   Test mode gives QEMU no standard input and a second serial port (COM2, nothing attached:
   ttytest's loopback /dev/ttyS1).
@@ -61,6 +64,9 @@ An AI research project; see README.md.
   scancodes; the server's VT and the kernel's monitor), `cargo test -p procproto` the text formats of `/proc` (procfs's
   and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
   kernel's random generator (ChaCha20) and the keyed hash (SipHash) against their test vectors,
+  `cargo test --release -p linkring` the link protocol (usbd <-> netd: the description, the
+  frame rings, the doorbells, with threads), `cargo test -p usb` usbd's USB protocols
+  (descriptors, the choice of function, RNDIS, NCM, CDC, hubs, HID boot keyboards),
   `cargo test --release -p clockpage` the clock page under the vDSO (the kernel's clock
   formulas, per-CPU offsets, no torn reading while a writer changes it, with threads),
   `cargo test -p elfcore` the core file's format, `coredump_filter` and `core_pattern`,
@@ -68,6 +74,12 @@ An AI research project; see README.md.
   netd's smoltcp (vendored with patches, its own workspace; the patches are listed in its
   `Cargo.toml` and marked `oxidenix:`).
 - QEMU must always run with a visible window; never use `-display none`.
+- Every boot has an xHCI controller (`qemu-xhci`, bus `xhci.0`): USB devices go on it with
+  arguments after `--`, e.g. `-netdev user,id=u1,net=10.0.3.0/24 -device
+  usb-net,netdev=u1,bus=xhci.0` (a tethering function), `-device usb-kbd,bus=xhci.0`, or a
+  phone of the host's to tether through: `-device usb-host,bus=xhci.0,vendorid=0x18d1,productid=...`
+  (needs access to its `/dev/bus/usb` node). `qemu-xhci,msi=off` (MSI-X) and
+  `msi=off,msix=off` (the legacy line) try usbd's other interrupt paths.
 - The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
   boots a BIOS image instead. CI runs the self-tests with both.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
@@ -135,6 +147,14 @@ An AI research project; see README.md.
   - Memory: `kernel/src/memory/` (the OOM killer `oom.rs`, the trees' memory groups and
     their limits `memcg.rs`: ADR 0024), `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
+  - USB (ADR 0025): `servers/usbd` (one per xHCI controller, `kernel/src/main.rs::start_usbd`):
+    `xhci/` (the controller: registers, rings, contexts, commands, events), `device.rs`
+    (slots, control and queued transfers), `hub.rs`, `net/` (CDC-ECM, CDC-NCM, RNDIS, each
+    function a link to netd over a channel: `crates/linkring`), `kbd.rs` (boot keyboards into
+    the kernel's keyboard queue); `crates/usb` (everything a device says, host-tested). The
+    kernel's part: `drivers/pci.rs` (memory BARs, MSI/MSI-X), `process::mmio_map`,
+    `process/irq.rs` (lines 16-31 are message-signalled), `channel::native_create` (a server
+    as a channel's client), `process::keeper` (restarts usbd).
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
     `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
     the same file protocol, read-only); I/O rings `crates/ring`, `docs/design/io-rings.md`.
