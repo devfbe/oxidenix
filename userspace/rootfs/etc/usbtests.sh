@@ -35,5 +35,9 @@ case "$log" in *"cdc_ether 52:54:00:aa:00:01"*) echo "PASS usbd: ECM on the root
 case "$log" in *"hub with 8 ports"*) echo "PASS usbd: the hub" ;; *) fail "usbd: no hub" ;; esac
 case "$log" in *"rndis_host 52:54:00:aa:00:02"*) echo "PASS usbd: RNDIS behind the hub" ;; *) fail "usbd: no RNDIS function" ;; esac
 
+# Last, as it changes the links' names: usbd's and netd's deaths.
+echo "=== usbnettest restarts"
+if usbnettest restarts; then echo "PASS usbnettest restarts"; else fail "usbnettest restarts"; fi
+
 echo "=== summary: $failed failed"
 [ "$failed" -eq 0 ]

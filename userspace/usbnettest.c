@@ -4,8 +4,8 @@
  * 10.0.3.0/24) and usb1 (RNDIS, behind a USB hub, on 10.0.4.0/24). Each
  * comes up with its DHCP lease, as Linux names and describes it, and
  * carries TCP to its network's echo service (.100:7) intact, also in bulk
- * and in both directions at once; and both come back after usbd dies, and
- * after netd dies. */
+ * and in both directions at once; and (`usbnettest restarts`) both come
+ * back after usbd dies, and after netd dies. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -62,6 +62,33 @@ static void address_of(const char *name, char *out, size_t len) {
     close(s);
 }
 
+/* The interface with the hardware address `mac` (its name into `out`, ""
+ * if there is none): after a restart the links come back in any order,
+ * and their names with it (as Linux names USB links by registration). */
+static void name_of(const unsigned char mac[6], char out[IFNAMSIZ]) {
+    out[0] = 0;
+    struct if_nameindex *all = if_nameindex();
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    for (struct if_nameindex *i = all; i && i->if_index; i++) {
+        struct ifreq r = {0};
+        strncpy(r.ifr_name, i->if_name, IFNAMSIZ - 1);
+        if (ioctl(s, SIOCGIFHWADDR, &r) == 0 && memcmp(r.ifr_hwaddr.sa_data, mac, 6) == 0) {
+            strncpy(out, i->if_name, IFNAMSIZ - 1);
+            out[IFNAMSIZ - 1] = 0;
+        }
+    }
+    close(s);
+    if (all) if_freenameindex(all);
+}
+
+/* The IPv4 address of the link with `mac` ("" while it has none). */
+static void address_by_mac(const unsigned char mac[6], char *out, size_t len) {
+    char name[IFNAMSIZ];
+    name_of(mac, name);
+    out[0] = 0;
+    if (name[0]) address_of(name, out, len);
+}
+
 /* Waits up to `ms` for every link's lease. */
 static int wait_for_leases(long ms) {
     long until = now_ms() + ms;
@@ -69,7 +96,7 @@ static int wait_for_leases(long ms) {
         int all = 1;
         for (size_t i = 0; i < sizeof links / sizeof *links; i++) {
             char a[32];
-            address_of(links[i].name, a, sizeof a);
+            address_by_mac(links[i].mac, a, sizeof a);
             all &= strncmp(a, links[i].subnet, strlen(links[i].subnet)) == 0;
         }
         if (all) return 1;
@@ -151,8 +178,16 @@ static int echo(const char *ip, size_t len, long *rate) {
     return ok;
 }
 
-int main(void) {
+static void restarts(void);
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && strcmp(argv[1], "restarts") == 0) {
+        restarts();
+        if (failures) printf("usbnettest: %d FAILED\n", failures);
+        else printf("usbnettest: all passed\n");
+        return failures != 0;
+    }
     check("both USB links have their leases (within 30 s)", wait_for_leases(30000));
     for (size_t i = 0; i < sizeof links / sizeof *links; i++) describes(&links[i]);
     check("no network card (no eth0)", if_nametoindex("eth0") == 0);
@@ -193,13 +228,20 @@ int main(void) {
     int st = 0;
     waitpid(kid, &st, 0);
     check("both links at once", mine && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (failures) printf("usbnettest: %d FAILED\n", failures);
+    else printf("usbnettest: all passed\n");
+    return failures != 0;
+}
 
+/* `usbnettest restarts`: the links survive their servers' deaths. */
+static void restarts(void) {
     /* usbd dies (as a crash would): the kernel starts it again (its
      * keeper), it finds the devices anew and offers netd new links, which
      * get their leases again; twice (a server whose memory was handed out
      * wrongly at its end shows at its next life). Then netd dies: the next
-     * use starts it again
-     * and usbd offers it the links anew. Either way the links work after. */
+     * use starts it again and usbd offers it the links anew. Either way the
+     * links work after (found by their addresses: they come back in any
+     * order, and their names with it). */
     const char *servers[] = {"usb0", "usb0", "net"};
     for (int i = 0; i < 3; i++) {
         char name[96];
@@ -211,19 +253,16 @@ int main(void) {
         int gone = 0;
         for (long until = now_ms() + 5000; !gone && now_ms() < until; usleep(20000)) {
             char a[32];
-            address_of("usb0", a, sizeof a);
+            address_by_mac(links[0].mac, a, sizeof a);
             gone = a[0] == 0;
         }
-        snprintf(name, sizeof name, "with %s, usb0's lease goes", servers[i]);
+        snprintf(name, sizeof name, "with %s, the ECM link's lease goes", servers[i]);
         check(name, gone);
         int back = wait_for_leases(30000);
         long rate = 0;
         snprintf(name, sizeof name, "after %s's death: both links and their leases back (%ld ms)", servers[i], now_ms() - t0);
         check(name, back);
-        snprintf(name, sizeof name, "after %s's death: TCP through usb0 and usb1", servers[i]);
+        snprintf(name, sizeof name, "after %s's death: TCP through both links", servers[i]);
         check(name, back && echo(links[0].echo, 64 << 10, &rate) && echo(links[1].echo, 64 << 10, &rate));
     }
-    if (failures) printf("usbnettest: %d FAILED\n", failures);
-    else printf("usbnettest: all passed\n");
-    return failures != 0;
 }
