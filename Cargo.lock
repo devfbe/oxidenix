@@ -373,6 +373,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linklayer"
+version = "0.1.0"
+dependencies = [
+ "smoltcp",
+]
+
+[[package]]
 name = "linkring"
 version = "0.1.0"
 dependencies = [
