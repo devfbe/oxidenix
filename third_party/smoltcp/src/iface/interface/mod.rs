@@ -363,6 +363,15 @@ impl Interface {
         self.inner.reuseport_hash = Some(f);
     }
 
+    /// oxidenix: the device's MTU changed (`DeviceCapabilities::
+    /// max_transmission_unit`, which the interface otherwise reads once,
+    /// in `new`): a device that is several links whose smallest MTU
+    /// changes as links come and go. Packets from now on and the MSS of
+    /// TCP connections made from now on follow it.
+    pub fn set_max_transmission_unit(&mut self, mtu: usize) {
+        self.inner.caps.max_transmission_unit = mtu;
+    }
+
     /// Get the HardwareAddress address of the interface.
     ///
     /// # Panics
